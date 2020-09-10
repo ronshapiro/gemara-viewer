@@ -2,8 +2,9 @@ import api_request_handler
 import argparse
 import json
 
-def input_file_path(ref):
-    return f"test_data/api_request_handler/{ref}.input.json"
+def input_file_path(url):
+    path = url[len("https://sefaria.org/"):].replace("/", "@")
+    return f"test_data/api_request_handler/{path}.input.json"
 
 class TestAmud(object):
     def __init__(self, masechet, amud):
@@ -19,14 +20,15 @@ class TestAmud(object):
 
 test_amudim = (
     TestAmud("Berakhot", "2a"),
+    # DO NOT SUBMIT
     TestAmud("Berakhot", "34b"),
     TestAmud("Shabbat", "100a"),
-    TestAmud("Eruvin", "11a"), # Has images
-    TestAmud("Eruvin", "6b"), # Has images, including a comment with multiple images
-    TestAmud("Niddah", "48b"),
-    TestAmud("Nazir", "33b"), # Has no gemara, just Tosafot
-    TestAmud("Shabbat", "74b"), # Has weird API response with nested comment text from Rosh
-    TestAmud("Tamid", "25b"), # No Rashi
+    #TestAmud("Eruvin", "11a"), # Has images
+    #TestAmud("Eruvin", "6b"), # Has images, including a comment with multiple images
+    #TestAmud("Niddah", "48b"),
+    #TestAmud("Nazir", "33b"), # Has no gemara, just Tosafot
+    #TestAmud("Shabbat", "74b"), # Has weird API response with nested comment text from Rosh
+    #TestAmud("Tamid", "25b"), # No Rashi
 )
 
 parser = argparse.ArgumentParser(description='Test')
@@ -34,8 +36,8 @@ parser.add_argument("--setup", action="store_const", const=True)
 args = parser.parse_args()
 
 class FakeRequestMaker(object):
-    async def request_amud(self, ref):
-        with open(input_file_path(ref), "r") as input_file:
+    async def request_amud(self, url, **ignored_params):
+        with open(input_file_path(url), "r") as input_file:
             return FakeResponse(input_file.read())
 
 
@@ -69,17 +71,24 @@ def write_json(file_name, data):
 class RecordingRequestMaker(object):
     def __init__(self):
         self._real_request_maker = api_request_handler.RealRequestMaker()
+        self.records = {}
 
-    async def request_amud(self, ref):
-        results = await self._real_request_maker.request_amud(ref)
-        write_json(input_file_path(ref), results.json())
+    async def request_amud(self, url, **params):
+        results = await self._real_request_maker.request_amud(url, **params)
+        self.records[input_file_path(url)] = results.json()
         return results
 
+    def write_json(self):
+        for file_name, result in self.records.items():
+            write_json(file_name, result)
+
 def setup():
-    request_handler = api_request_handler.ApiRequestHandler(RecordingRequestMaker())
+    request_maker = RecordingRequestMaker()
+    request_handler = api_request_handler.ApiRequestHandler(request_maker)
     for test_amud in test_amudim:
         write_json(test_amud.output_file_path(),
                    request_handler.amud_api_request(test_amud.masechet, test_amud.amud))
+    request_maker.write_json()
 
 if args.setup:
     setup()

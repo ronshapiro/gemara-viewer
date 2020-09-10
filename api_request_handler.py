@@ -21,24 +21,13 @@ _TAV = "ת"
 _STEINSALTZ_SUGYA_START = re.compile("^<big>[%s-%s]" % (_ALEPH, _TAV))
 
 class RealRequestMaker(object):
-    async def request_amud(self, ref):
+    async def request_amud(self, url, **params):
         # It seems like the http client should be cached, but that causes errors with the event
         # loop. The httpx documentation mentions that the main benefits here are connection pooling,
         # which would be nice since we connect to the same host repeatedly. But because there's a
         # response cache in server.py, it's not an urgent peformance issue.
         async with httpx.AsyncClient() as client:
-            return await client.get(
-                # https://github.com/Sefaria/Sefaria-Project/wiki/API-Documentation
-                f"https://sefaria.org/api/texts/{ref}",
-                params = {
-                    "commentary": "1",
-                    # Even with wrapLinks=1, Jastrow (and perhaps more) is still wrapped. Instead,
-                    # an active filtering is performed just in case.
-                    "wrapLinks": "0",
-                    # This shouldn't have a difference for the Gemara reqeusts, but it does expand
-                    # the Rashi/Tosafot requests to have the entire amud's worth of commentary
-                    "pad": "0",
-                })
+            return await client.get(url, params=params)
 
 def standard_english_transformations(english):
     return SectionSymbolRemover.process(SefariaLinkSanitizer.process(english))
@@ -48,10 +37,36 @@ class AbstractApiRequestHandler(object):
         self._request_maker = request_maker
         self._print = print_function
 
-    def _make_requests(self, *args):
-        raise NotImplementedError()
+    def _run_all_async(self, requests):
+        return self._results_to_json(asyncio.run(self._gather_all(requests)))
+
+    async def _gather_all(self, requests):
+        return await asyncio.gather(*requests)
+
+    def _api_and_links_request(self, ref):
+        return [
+            # DO NOT SUBMIT: rename methods
+            self._request_maker.request_amud(
+                f"https://sefaria.org/api/texts/{ref}",
+                context="0",
+                commentary="0",
+                # Even with wrapLinks=1, Jastrow (and perhaps more) is still wrapped. Instead,
+                # an active filtering is performed just in case.
+                wrapLinks="0",
+            ),
+            self._request_maker.request_amud(f"https://sefaria.org/api/links/{ref}", with_text="0"),
+        ]
+
+    def _api_and_links_requests(self, refs):
+        requests = []
+        for ref in refs:
+            requests += self._api_and_links_request(ref)
+        return requests
 
     def _make_id(self, *args):
+        raise NotImplementedError()
+
+    def _make_ref(self, *args):
         raise NotImplementedError()
 
     def _translate_hebrew_text(self, text):
@@ -66,12 +81,10 @@ class AbstractApiRequestHandler(object):
     def _post_process_all_sections(self, sections, *args):
         return sections
 
-    def handle_request(self, *args):
-        sefaria_results = asyncio.run(self._make_requests(*args))
-
-        bad_results = list(filter(lambda x: x.status_code != 200, sefaria_results))
+    def _results_to_json(self, results):
+        bad_results = list(filter(lambda x: x.status_code != 200, results))
         def _raise_bad_results_exception():
-            raise ApiException(
+            raise ValueErrorException(
                 "\n".join(map(lambda x: x.text, bad_results)),
                 500,
                 ApiException.SEFARIA_HTTP_ERROR)
@@ -79,13 +92,46 @@ class AbstractApiRequestHandler(object):
             _raise_bad_results_exception()
 
         try:
-            results_as_json = list(map(lambda x: x.json(), sefaria_results))
+            return list(map(lambda x: x.json(), results))
         except Exception:
             _raise_bad_results_exception()
 
+    def _extract_desired_comments(self, links_response):
+        links = []
+        for link in links_response:
+            if _matching_commentary_kind(link):
+                links.append(link)
+        return links
+
+    def handle_request(self, *args):
+        ref = self._make_ref(*args)
+        initial_results = self._run_all_async(self._api_and_links_request(ref))
+        # DO NOT SUBMIT: dedupe and enjoin adjacent calls
+        comments = self._extract_desired_comments(initial_results[1])
+        comment_results = []
+        MAX_CONCURRENT_COMMENTS = 50000 # DO NOT SUBMIT: constant
+        for i in range(0, len(comments), MAX_CONCURRENT_COMMENTS):
+            comment_results += self._run_all_async(
+                self._api_and_links_requests([x["ref"] for x in comments[i:i+MAX_CONCURRENT_COMMENTS]]))
+
+        #comment_results = self._run_all_async(
+        #    self._api_and_links_requests([x["ref"] for x in comments]))
+        # DO NOT SUBMIT: extract method:
+        for i in range(len(comments)):
+            comment = comments[i]
+            result = comment_results[i * 2]
+            comment["text"] = result["text"]
+            comment["he"] = result["he"]
+            # DO NOT SUBMIT: simpler diffs
+            if comment["text"] == "":
+                comment["text"] = []
+
+        initial_results[1]
+        results_as_json = initial_results # do not submit
+
         result = {"id": self._make_id(*args)}
 
-        main_json = results_as_json[0]
+        main_json = initial_results[0]
         for i in ["title"]:
             result[i] = main_json[i]
 
@@ -114,6 +160,9 @@ class AbstractApiRequestHandler(object):
             })
 
         section_prefix = f"{main_ref}:"
+        for comment in comments:
+            self._add_comment_to_result(comment, sections, section_prefix)
+            
         for comment in main_json["commentary"]:
             self._add_comment_to_result(comment, sections, section_prefix)
 
@@ -140,8 +189,6 @@ class AbstractApiRequestHandler(object):
             return
 
         matching_commentary_kind = _matching_commentary_kind(comment)
-        if not matching_commentary_kind:
-            return
 
         section = self._find_matching_section_index(comment, section_prefix)
         if section is None or section >= len(sections):
@@ -215,6 +262,9 @@ class ApiRequestHandler(AbstractApiRequestHandler):
 
     def _make_id(self, masechet, amud):
         return amud
+
+    def _make_ref(self, masechet, amud):
+        return f"{masechet}.{amud}"
 
     def _post_process_section(self, section):
         self._resolve_duplicated_out_and_nested_comments(section)
